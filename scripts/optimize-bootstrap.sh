@@ -24,6 +24,18 @@ RW_BOOTSTRAP_BASE_URL="${RW_BOOTSTRAP_BASE_URL:-https://raw.githubusercontent.co
 RW_BOOTSTRAP_VERSION_EXPECTED="${RW_BOOTSTRAP_VERSION_EXPECTED:-}"
 RW_BOOTSTRAP_APPLY_TARGET="${RW_BOOTSTRAP_APPLY_TARGET:-all}"
 RW_BOOTSTRAP_SAMPLE_SECONDS="${RW_BOOTSTRAP_SAMPLE_SECONDS:-1}"
+RW_BOOTSTRAP_FETCH_RETRIES="${RW_BOOTSTRAP_FETCH_RETRIES:-3}"
+RW_BOOTSTRAP_FETCH_RETRY_DELAY="${RW_BOOTSTRAP_FETCH_RETRY_DELAY:-2}"
+RW_BOOTSTRAP_FETCH_FORCE_IPV4="${RW_BOOTSTRAP_FETCH_FORCE_IPV4:-0}"
+RW_BOOTSTRAP_FETCH_CURL_ARGS="${RW_BOOTSTRAP_FETCH_CURL_ARGS:-}"
+RW_BOOTSTRAP_FETCH_CURL_ARGS_REDACT="${RW_BOOTSTRAP_FETCH_CURL_ARGS_REDACT:-token,password,passwd,authorization,bearer,key,secret}"
+RW_BOOTSTRAP_FETCH_LAST_ERROR_CLASS=""
+RW_BOOTSTRAP_FETCH_LAST_ERROR_FILE=""
+RW_BOOTSTRAP_FETCH_LAST_ERROR_URL=""
+RW_BOOTSTRAP_FETCH_LAST_ERROR_CODE=""
+RW_BOOTSTRAP_FETCH_LAST_ERROR_ATTEMPTS="0"
+RW_BOOTSTRAP_FETCH_FAILED="0"
+RW_BOOTSTRAP_FETCH_STRATEGY_MARKERS=""
 
 BEFORE_SNAPSHOT_STATUS="failed"
 BEFORE_DIAG_STATUS="failed"
@@ -32,6 +44,9 @@ AFTER_SNAPSHOT_STATUS="failed"
 SNAPSHOT_RESULT_STATUS="failed"
 APPLY_STATUS="failed"
 APPLY_DETAIL="not started"
+FETCH_STATUS="ok"
+FETCH_DETAIL="payload fetched and verified"
+APPLY_STARTED="0"
 TX_ID=""
 
 REQUIRED_FILES=(
@@ -84,6 +99,102 @@ log_error() {
 die() {
   log_error "$1"
   exit "$EXIT_RUNTIME"
+}
+
+sanitize_fetch_args_for_log() {
+  local raw="$1"
+  local redacted="$raw"
+  local list="${RW_BOOTSTRAP_FETCH_CURL_ARGS_REDACT}"
+  local item=""
+
+  redacted="$(printf '%s' "$redacted" | sed -E 's@(https?://)[^/@:]+:[^/@]+@@g')"
+
+  IFS=',' read -r -a _rw_redact_items <<< "$list"
+  for item in "${_rw_redact_items[@]}"; do
+    item="$(printf '%s' "$item" | tr '[:upper:]' '[:lower:]' | xargs)"
+    [ -n "$item" ] || continue
+    redacted="$(printf '%s' "$redacted" | sed -E "s@(${item})=([^[:space:]]+)@\1=<redacted>@Ig")"
+  done
+
+  printf '%s' "$redacted"
+}
+
+ensure_fetch_numeric_config() {
+  [[ "$RW_BOOTSTRAP_FETCH_RETRIES" =~ ^[1-9][0-9]*$ ]] || die "RW_BOOTSTRAP_FETCH_RETRIES must be a positive integer"
+  [[ "$RW_BOOTSTRAP_FETCH_RETRY_DELAY" =~ ^[0-9]+$ ]] || die "RW_BOOTSTRAP_FETCH_RETRY_DELAY must be a non-negative integer"
+  case "$RW_BOOTSTRAP_FETCH_FORCE_IPV4" in
+    0|1) ;;
+    *) die "RW_BOOTSTRAP_FETCH_FORCE_IPV4 must be 0 or 1" ;;
+  esac
+}
+
+reset_fetch_error_state() {
+  RW_BOOTSTRAP_FETCH_LAST_ERROR_CLASS=""
+  RW_BOOTSTRAP_FETCH_LAST_ERROR_FILE=""
+  RW_BOOTSTRAP_FETCH_LAST_ERROR_URL=""
+  RW_BOOTSTRAP_FETCH_LAST_ERROR_CODE=""
+  RW_BOOTSTRAP_FETCH_LAST_ERROR_ATTEMPTS="0"
+  RW_BOOTSTRAP_FETCH_FAILED="0"
+}
+
+configure_fetch_strategy_markers() {
+  local markers=()
+  if [ "$RW_BOOTSTRAP_FETCH_FORCE_IPV4" = "1" ]; then
+    markers+=("ipv4-enabled")
+  else
+    markers+=("ipv4-disabled")
+  fi
+
+  if [ -n "$RW_BOOTSTRAP_FETCH_CURL_ARGS" ]; then
+    markers+=("custom-args-enabled")
+  else
+    markers+=("custom-args-disabled")
+  fi
+
+  RW_BOOTSTRAP_FETCH_STRATEGY_MARKERS="$(IFS=','; printf '%s' "${markers[*]}")"
+}
+
+classify_fetch_error() {
+  local curl_code="$1"
+  case "$curl_code" in
+    6|7)
+      printf '%s' "connectivity"
+      ;;
+    28|35)
+      printf '%s' "tls-timeout"
+      ;;
+    22)
+      printf '%s' "http"
+      ;;
+    *)
+      printf '%s' "unknown"
+      ;;
+  esac
+}
+
+record_fetch_error() {
+  local class="$1"
+  local filename="$2"
+  local url="$3"
+  local curl_code="$4"
+  local attempts="$5"
+
+  RW_BOOTSTRAP_FETCH_LAST_ERROR_CLASS="$class"
+  RW_BOOTSTRAP_FETCH_LAST_ERROR_FILE="$filename"
+  RW_BOOTSTRAP_FETCH_LAST_ERROR_URL="$url"
+  RW_BOOTSTRAP_FETCH_LAST_ERROR_CODE="$curl_code"
+  RW_BOOTSTRAP_FETCH_LAST_ERROR_ATTEMPTS="$attempts"
+  RW_BOOTSTRAP_FETCH_FAILED="1"
+}
+
+mark_fetch_failure() {
+  local reason="$1"
+  FETCH_STATUS="failed"
+  FETCH_DETAIL="$reason"
+  APPLY_STATUS="failed"
+  APPLY_DETAIL="apply was not started because fetch/verify failed"
+  APPLY_STARTED="0"
+  mark_runtime_failure
 }
 
 normalize_speed() {
@@ -188,35 +299,77 @@ download_file() {
   local url="${RW_BOOTSTRAP_BASE_URL}/${filename}"
   local out="${WORKDIR}/${filename}"
   local out_dir=""
+  local attempt=1
+  local max_attempts="$RW_BOOTSTRAP_FETCH_RETRIES"
+  local delay="$RW_BOOTSTRAP_FETCH_RETRY_DELAY"
+  local curl_rc=0
+  local class=""
+  local -a curl_cmd=(curl -fsSL)
+  local -a custom_curl_args=()
 
   out_dir="$(dirname "$out")"
   mkdir -p "$out_dir" || die "Failed to create payload directory for ${filename}"
 
   if [ -f "$url" ]; then
-    cp "$url" "$out" || die "Failed to copy ${filename} from ${url}"
+    cp "$url" "$out" || {
+      record_fetch_error "unknown" "$filename" "$url" "cp-failed" "1"
+      log_error "Failed to copy ${filename} from ${url}"
+      return 1
+    }
     return 0
   fi
 
-  if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$url" -o "$out" || die "Failed to download ${filename} from ${url}"
-    return 0
+  if [ "$RW_BOOTSTRAP_FETCH_FORCE_IPV4" = "1" ]; then
+    curl_cmd+=(-4)
   fi
 
-  if command -v wget >/dev/null 2>&1; then
-    wget -qO "$out" "$url" || die "Failed to download ${filename} from ${url}"
-    return 0
+  if [ -n "$RW_BOOTSTRAP_FETCH_CURL_ARGS" ]; then
+    read -r -a custom_curl_args <<< "$RW_BOOTSTRAP_FETCH_CURL_ARGS"
+    curl_cmd+=("${custom_curl_args[@]}")
   fi
 
-  die "Neither curl nor wget is available for downloading payload"
+  if ! command -v curl >/dev/null 2>&1; then
+    if command -v wget >/dev/null 2>&1; then
+      if wget -qO "$out" "$url"; then
+        return 0
+      fi
+      record_fetch_error "unknown" "$filename" "$url" "wget-failed" "1"
+      log_error "Failed to download ${filename} from ${url}"
+      return 1
+    fi
+    record_fetch_error "unknown" "$filename" "$url" "no-fetch-tool" "1"
+    log_error "Neither curl nor wget is available for downloading payload"
+    return 1
+  fi
+
+  while [ "$attempt" -le "$max_attempts" ]; do
+    if "${curl_cmd[@]}" "$url" -o "$out" >/dev/null 2>&1; then
+      curl_rc=0
+      return 0
+    else
+      curl_rc=$?
+    fi
+
+    class="$(classify_fetch_error "$curl_rc")"
+    log_info "Fetch retry ${attempt}/${max_attempts} for ${filename} (class=${class}, curl_exit=${curl_rc})"
+    attempt=$((attempt + 1))
+    [ "$attempt" -le "$max_attempts" ] && sleep "$delay"
+  done
+
+  record_fetch_error "$class" "$filename" "$url" "$curl_rc" "$max_attempts"
+  log_error "Failed to download ${filename} from ${url}"
+  return 1
 }
 
 ensure_required_files_present() {
   local f=""
   for f in "${REQUIRED_FILES[@]}"; do
     if [ ! -f "${WORKDIR}/${f}" ] || [ ! -s "${WORKDIR}/${f}" ]; then
-      die "Required payload file missing or empty: ${f}"
+      log_error "Required payload file missing or empty: ${f}"
+      return 1
     fi
   done
+  return 0
 }
 
 verify_version() {
@@ -224,14 +377,17 @@ verify_version() {
   actual="$(tr -d '\r' < "${WORKDIR}/VERSION" | awk 'NF{print; exit}')"
 
   if [ -z "$actual" ]; then
-    die "VERSION file is empty"
+    log_error "VERSION file is empty"
+    return 1
   fi
 
   if [ -n "$RW_BOOTSTRAP_VERSION_EXPECTED" ] && [ "$actual" != "$RW_BOOTSTRAP_VERSION_EXPECTED" ]; then
-    die "VERSION mismatch: expected ${RW_BOOTSTRAP_VERSION_EXPECTED}, got ${actual}"
+    log_error "VERSION mismatch: expected ${RW_BOOTSTRAP_VERSION_EXPECTED}, got ${actual}"
+    return 1
   fi
 
   log_info "Payload VERSION: ${actual}"
+  return 0
 }
 
 verify_manifest() {
@@ -241,7 +397,10 @@ verify_manifest() {
     (
       cd "$WORKDIR" || exit 1
       sha256sum -c "$manifest" --status
-    ) || die "Checksum verification failed against manifest.sha256"
+    ) || {
+      log_error "Checksum verification failed against manifest.sha256"
+      return 1
+    }
     return 0
   fi
 
@@ -249,25 +408,47 @@ verify_manifest() {
     (
       cd "$WORKDIR" || exit 1
       shasum -a 256 -c "$manifest" --status
-    ) || die "Checksum verification failed against manifest.sha256"
+    ) || {
+      log_error "Checksum verification failed against manifest.sha256"
+      return 1
+    }
     return 0
   fi
 
-  die "No SHA-256 verifier found (need sha256sum or shasum)"
+  log_error "No SHA-256 verifier found (need sha256sum or shasum)"
+  return 1
 }
 
 fetch_and_verify_payload() {
   local f=""
   for f in "${REQUIRED_FILES[@]}"; do
-    download_file "$f"
+    if ! download_file "$f"; then
+      mark_fetch_failure "payload fetch failed"
+      return 1
+    fi
   done
 
-  ensure_required_files_present
-  verify_version
-  verify_manifest
-  chmod +x "${WORKDIR}/scripts/optimize-bootstrap.sh" "${WORKDIR}/scripts/optimize.sh" "${WORKDIR}/scripts/diag.sh" "${WORKDIR}/scripts/snapshot.sh"
+  if ! ensure_required_files_present; then
+    mark_fetch_failure "required payload files missing after fetch"
+    return 1
+  fi
+  if ! verify_version; then
+    mark_fetch_failure "payload VERSION verification failed"
+    return 1
+  fi
+  if ! verify_manifest; then
+    mark_fetch_failure "payload manifest verification failed"
+    return 1
+  fi
+  if ! chmod +x "${WORKDIR}/scripts/optimize-bootstrap.sh" "${WORKDIR}/scripts/optimize.sh" "${WORKDIR}/scripts/diag.sh" "${WORKDIR}/scripts/snapshot.sh"; then
+    mark_fetch_failure "payload chmod failed"
+    return 1
+  fi
 
+  FETCH_STATUS="ok"
+  FETCH_DETAIL="payload fetched and verified"
   log_info "Payload integrity verification passed"
+  return 0
 }
 
 init_run_context() {
@@ -334,6 +515,7 @@ run_before() {
 }
 
 run_apply() {
+  APPLY_STARTED="1"
   local apply_log="${RUN_DIR}/apply.log"
   local -a apply_cmd=(bash "${WORKDIR}/scripts/optimize.sh" --apply "$RW_BOOTSTRAP_APPLY_TARGET")
 
@@ -425,12 +607,17 @@ print_report() {
 
   echo
   echo "BEFORE"
+  echo "- fetch: status=${FETCH_STATUS}; detail=${FETCH_DETAIL}"
+  if [ "$RW_BOOTSTRAP_FETCH_FAILED" = "1" ]; then
+    echo "- fetch-evidence: class=${RW_BOOTSTRAP_FETCH_LAST_ERROR_CLASS}; file=${RW_BOOTSTRAP_FETCH_LAST_ERROR_FILE}; url=${RW_BOOTSTRAP_FETCH_LAST_ERROR_URL}; curl_exit=${RW_BOOTSTRAP_FETCH_LAST_ERROR_CODE}; attempts=${RW_BOOTSTRAP_FETCH_LAST_ERROR_ATTEMPTS}; strategy=${RW_BOOTSTRAP_FETCH_STRATEGY_MARKERS}"
+  fi
   echo "- snapshot: ${BEFORE_SNAPSHOT_STATUS}"
   echo "- diagnostics: ${BEFORE_DIAG_STATUS}"
   echo "- logs: ${RUN_DIR}/before-snapshot.log, ${RUN_DIR}/before-diag.log"
 
   echo
   echo "APPLIED"
+  echo "- apply-started: ${APPLY_STARTED}"
   echo "- optimize: status=${normalized_apply_status}; target=${RW_BOOTSTRAP_APPLY_TARGET}; detail=${APPLY_DETAIL}"
   if [ -n "$SPEED_NORMALIZED" ]; then
     echo "- shaping: status=${normalized_apply_status}; speed=${SPEED_NORMALIZED}; pass-through=--shaping"
@@ -458,6 +645,10 @@ print_report() {
   fi
 
   echo "- verify: inspect ${RUN_DIR}/snapshot-result.log and rerun diagnostics with ./scripts/diag.sh after reboot/restart."
+  if [ "$RW_BOOTSTRAP_FETCH_FAILED" = "1" ]; then
+    echo "- rerun-network: RW_BOOTSTRAP_FETCH_FORCE_IPV4=1 RW_BOOTSTRAP_FETCH_RETRIES=${RW_BOOTSTRAP_FETCH_RETRIES} RW_BOOTSTRAP_FETCH_RETRY_DELAY=${RW_BOOTSTRAP_FETCH_RETRY_DELAY} bash scripts/optimize-bootstrap.sh --dry-run"
+    echo "- rerun-network-custom: RW_BOOTSTRAP_FETCH_CURL_ARGS='<curl args>' bash scripts/optimize-bootstrap.sh --dry-run"
+  fi
   if [ -n "$TX_ID" ]; then
     echo "- rollback: ./scripts/optimize.sh --rollback ${TX_ID}"
     echo "- verify-reboot: ./scripts/optimize.sh --verify-reboot ${TX_ID}"
@@ -478,6 +669,9 @@ print_report() {
 main() {
   parse_args "$@"
   validate_mode_combination
+  ensure_fetch_numeric_config
+  reset_fetch_error_state
+  configure_fetch_strategy_markers
 
   log_info "Parsed mode: $( [ "$ASSUME_YES" -eq 1 ] && echo apply || echo dry-run )"
   if [ -n "$SPEED_NORMALIZED" ]; then
@@ -487,14 +681,15 @@ main() {
   fi
 
   setup_workdir
-  fetch_and_verify_payload
   init_run_context
 
-  run_before
-  run_apply
-  run_after
-  print_report
+  if fetch_and_verify_payload; then
+    run_before
+    run_apply
+    run_after
+  fi
 
+  print_report
   exit "$REPORT_EXIT"
 }
 
