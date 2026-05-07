@@ -31,9 +31,12 @@ RW_BOOTSTRAP_FETCH_FORCE_IPV4="${RW_BOOTSTRAP_FETCH_FORCE_IPV4:-1}"
 RW_BOOTSTRAP_FETCH_FORCE_IPV6="${RW_BOOTSTRAP_FETCH_FORCE_IPV6:-0}"
 RW_BOOTSTRAP_FETCH_CURL_ARGS="${RW_BOOTSTRAP_FETCH_CURL_ARGS:-}"
 RW_BOOTSTRAP_FETCH_CURL_ARGS_REDACT="${RW_BOOTSTRAP_FETCH_CURL_ARGS_REDACT:-token,password,passwd,authorization,bearer,key,secret}"
+RW_BOOTSTRAP_FETCH_TOOL="${RW_BOOTSTRAP_FETCH_TOOL:-auto}"
+RW_BOOTSTRAP_FETCH_WGET_ARGS="${RW_BOOTSTRAP_FETCH_WGET_ARGS:-}"
 RW_BOOTSTRAP_FETCH_LAST_ERROR_CLASS=""
 RW_BOOTSTRAP_FETCH_LAST_ERROR_FILE=""
 RW_BOOTSTRAP_FETCH_LAST_ERROR_URL=""
+RW_BOOTSTRAP_FETCH_LAST_ERROR_TOOL=""
 RW_BOOTSTRAP_FETCH_LAST_ERROR_CODE=""
 RW_BOOTSTRAP_FETCH_LAST_ERROR_ATTEMPTS="0"
 RW_BOOTSTRAP_FETCH_FAILED="0"
@@ -88,6 +91,9 @@ Environment overrides:
   RW_BOOTSTRAP_WORKDIR           Optional local workdir (default: /tmp/rw-oneliner).
   RW_BOOTSTRAP_APPLY_TARGET      scripts/optimize.sh --apply target (default: all).
   RW_BOOTSTRAP_SAMPLE_SECONDS    Snapshot sampling window for bootstrap runs (default: 1).
+  RW_BOOTSTRAP_FETCH_TOOL        Fetch tool mode: auto|curl|wget (default: auto).
+  RW_BOOTSTRAP_FETCH_CURL_ARGS   Extra curl args for constrained networks.
+  RW_BOOTSTRAP_FETCH_WGET_ARGS   Extra wget args for constrained networks.
   Payload layout                 VERSION, manifest.sha256, scripts/optimize-bootstrap.sh, scripts/optimize.sh, scripts/diag.sh, scripts/snapshot.sh.
 EOF
 }
@@ -130,12 +136,19 @@ ensure_fetch_numeric_config() {
     0|1) ;;
     *) die "RW_BOOTSTRAP_FETCH_FORCE_IPV4 must be 0 or 1" ;;
   esac
+
+  RW_BOOTSTRAP_FETCH_TOOL="$(printf '%s' "$RW_BOOTSTRAP_FETCH_TOOL" | tr '[:upper:]' '[:lower:]')"
+  case "$RW_BOOTSTRAP_FETCH_TOOL" in
+    auto|curl|wget) ;;
+    *) die "RW_BOOTSTRAP_FETCH_TOOL must be one of: auto, curl, wget" ;;
+  esac
 }
 
 reset_fetch_error_state() {
   RW_BOOTSTRAP_FETCH_LAST_ERROR_CLASS=""
   RW_BOOTSTRAP_FETCH_LAST_ERROR_FILE=""
   RW_BOOTSTRAP_FETCH_LAST_ERROR_URL=""
+  RW_BOOTSTRAP_FETCH_LAST_ERROR_TOOL=""
   RW_BOOTSTRAP_FETCH_LAST_ERROR_CODE=""
   RW_BOOTSTRAP_FETCH_LAST_ERROR_ATTEMPTS="0"
   RW_BOOTSTRAP_FETCH_FAILED="0"
@@ -143,6 +156,7 @@ reset_fetch_error_state() {
 
 configure_fetch_strategy_markers() {
   local markers=()
+  markers+=("tool=${RW_BOOTSTRAP_FETCH_TOOL}")
   if [ "$FORCE_IPV6" = "1" ]; then
     markers+=("ipv6-enabled")
   elif [ "$RW_BOOTSTRAP_FETCH_FORCE_IPV4" = "1" ]; then
@@ -152,9 +166,15 @@ configure_fetch_strategy_markers() {
   fi
 
   if [ -n "$RW_BOOTSTRAP_FETCH_CURL_ARGS" ]; then
-    markers+=("custom-args-enabled")
+    markers+=("curl-args-enabled")
   else
-    markers+=("custom-args-disabled")
+    markers+=("curl-args-disabled")
+  fi
+
+  if [ -n "$RW_BOOTSTRAP_FETCH_WGET_ARGS" ]; then
+    markers+=("wget-args-enabled")
+  else
+    markers+=("wget-args-disabled")
   fi
 
   RW_BOOTSTRAP_FETCH_STRATEGY_MARKERS="$(IFS=','; printf '%s' "${markers[*]}")"
@@ -178,17 +198,37 @@ classify_fetch_error() {
   esac
 }
 
+classify_wget_error() {
+  local wget_code="$1"
+  case "$wget_code" in
+    4)
+      printf '%s' "connectivity"
+      ;;
+    5)
+      printf '%s' "tls-timeout"
+      ;;
+    8)
+      printf '%s' "http"
+      ;;
+    *)
+      printf '%s' "unknown"
+      ;;
+  esac
+}
+
 record_fetch_error() {
   local class="$1"
   local filename="$2"
   local url="$3"
-  local curl_code="$4"
-  local attempts="$5"
+  local tool="$4"
+  local tool_code="$5"
+  local attempts="$6"
 
   RW_BOOTSTRAP_FETCH_LAST_ERROR_CLASS="$class"
   RW_BOOTSTRAP_FETCH_LAST_ERROR_FILE="$filename"
   RW_BOOTSTRAP_FETCH_LAST_ERROR_URL="$url"
-  RW_BOOTSTRAP_FETCH_LAST_ERROR_CODE="$curl_code"
+  RW_BOOTSTRAP_FETCH_LAST_ERROR_TOOL="$tool"
+  RW_BOOTSTRAP_FETCH_LAST_ERROR_CODE="$tool_code"
   RW_BOOTSTRAP_FETCH_LAST_ERROR_ATTEMPTS="$attempts"
   RW_BOOTSTRAP_FETCH_FAILED="1"
 }
@@ -303,11 +343,10 @@ setup_workdir() {
   mkdir -p "$WORKDIR" || die "Failed to create workdir: ${WORKDIR}"
 }
 
-download_file() {
+download_with_curl() {
   local filename="$1"
-  local url="${RW_BOOTSTRAP_BASE_URL}/${filename}"
-  local out="${WORKDIR}/${filename}"
-  local out_dir=""
+  local url="$2"
+  local out="$3"
   local attempt=1
   local max_attempts="$RW_BOOTSTRAP_FETCH_RETRIES"
   local delay="$RW_BOOTSTRAP_FETCH_RETRY_DELAY"
@@ -316,16 +355,9 @@ download_file() {
   local -a curl_cmd=(curl -fsSL)
   local -a custom_curl_args=()
 
-  out_dir="$(dirname "$out")"
-  mkdir -p "$out_dir" || die "Failed to create payload directory for ${filename}"
-
-  if [ -f "$url" ]; then
-    cp "$url" "$out" || {
-      record_fetch_error "unknown" "$filename" "$url" "cp-failed" "1"
-      log_error "Failed to copy ${filename} from ${url}"
-      return 1
-    }
-    return 0
+  if ! command -v curl >/dev/null 2>&1; then
+    record_fetch_error "unknown" "$filename" "$url" "curl" "missing" "0"
+    return 1
   fi
 
   if [ "$FORCE_IPV6" = "1" ]; then
@@ -339,35 +371,107 @@ download_file() {
     curl_cmd+=("${custom_curl_args[@]}")
   fi
 
-  if ! command -v curl >/dev/null 2>&1; then
-    if command -v wget >/dev/null 2>&1; then
-      if wget -qO "$out" "$url"; then
-        return 0
-      fi
-      record_fetch_error "unknown" "$filename" "$url" "wget-failed" "1"
-      log_error "Failed to download ${filename} from ${url}"
-      return 1
-    fi
-    record_fetch_error "unknown" "$filename" "$url" "no-fetch-tool" "1"
-    log_error "Neither curl nor wget is available for downloading payload"
-    return 1
-  fi
-
   while [ "$attempt" -le "$max_attempts" ]; do
     if "${curl_cmd[@]}" "$url" -o "$out" >/dev/null 2>&1; then
-      curl_rc=0
       return 0
-    else
-      curl_rc=$?
     fi
 
+    curl_rc=$?
     class="$(classify_fetch_error "$curl_rc")"
-    log_info "Fetch retry ${attempt}/${max_attempts} for ${filename} (class=${class}, curl_exit=${curl_rc})"
+    log_info "Fetch retry ${attempt}/${max_attempts} for ${filename} (tool=curl, class=${class}, exit=${curl_rc})"
     attempt=$((attempt + 1))
     [ "$attempt" -le "$max_attempts" ] && sleep "$delay"
   done
 
-  record_fetch_error "$class" "$filename" "$url" "$curl_rc" "$max_attempts"
+  record_fetch_error "$class" "$filename" "$url" "curl" "$curl_rc" "$max_attempts"
+  return 1
+}
+
+download_with_wget() {
+  local filename="$1"
+  local url="$2"
+  local out="$3"
+  local attempt=1
+  local max_attempts="$RW_BOOTSTRAP_FETCH_RETRIES"
+  local delay="$RW_BOOTSTRAP_FETCH_RETRY_DELAY"
+  local wget_rc=0
+  local class=""
+  local -a wget_cmd=(wget -q -O "$out")
+  local -a custom_wget_args=()
+
+  if ! command -v wget >/dev/null 2>&1; then
+    record_fetch_error "unknown" "$filename" "$url" "wget" "missing" "0"
+    return 1
+  fi
+
+  if [ "$FORCE_IPV6" = "1" ]; then
+    wget_cmd+=(-6)
+  elif [ "$RW_BOOTSTRAP_FETCH_FORCE_IPV4" = "1" ]; then
+    wget_cmd+=(-4)
+  fi
+
+  if [ -n "$RW_BOOTSTRAP_FETCH_WGET_ARGS" ]; then
+    read -r -a custom_wget_args <<< "$RW_BOOTSTRAP_FETCH_WGET_ARGS"
+    wget_cmd+=("${custom_wget_args[@]}")
+  fi
+
+  while [ "$attempt" -le "$max_attempts" ]; do
+    if "${wget_cmd[@]}" "$url" >/dev/null 2>&1; then
+      return 0
+    fi
+
+    wget_rc=$?
+    class="$(classify_wget_error "$wget_rc")"
+    log_info "Fetch retry ${attempt}/${max_attempts} for ${filename} (tool=wget, class=${class}, exit=${wget_rc})"
+    attempt=$((attempt + 1))
+    [ "$attempt" -le "$max_attempts" ] && sleep "$delay"
+  done
+
+  record_fetch_error "$class" "$filename" "$url" "wget" "$wget_rc" "$max_attempts"
+  return 1
+}
+
+download_file() {
+  local filename="$1"
+  local url="${RW_BOOTSTRAP_BASE_URL}/${filename}"
+  local out="${WORKDIR}/${filename}"
+  local out_dir=""
+
+  out_dir="$(dirname "$out")"
+  mkdir -p "$out_dir" || die "Failed to create payload directory for ${filename}"
+
+  if [ -f "$url" ]; then
+    cp "$url" "$out" || {
+      record_fetch_error "unknown" "$filename" "$url" "local-copy" "cp-failed" "1"
+      log_error "Failed to copy ${filename} from ${url}"
+      return 1
+    }
+    return 0
+  fi
+
+  case "$RW_BOOTSTRAP_FETCH_TOOL" in
+    curl)
+      if download_with_curl "$filename" "$url" "$out"; then
+        return 0
+      fi
+      ;;
+    wget)
+      if download_with_wget "$filename" "$url" "$out"; then
+        return 0
+      fi
+      ;;
+    auto)
+      if download_with_curl "$filename" "$url" "$out"; then
+        return 0
+      fi
+      log_info "Retrying with wget after curl exhausted for ${filename}"
+      if download_with_wget "$filename" "$url" "$out"; then
+        reset_fetch_error_state
+        return 0
+      fi
+      ;;
+  esac
+
   log_error "Failed to download ${filename} from ${url}"
   return 1
 }
@@ -627,7 +731,7 @@ print_report() {
   echo "BEFORE"
   echo "- fetch: status=${FETCH_STATUS}; detail=${FETCH_DETAIL}"
   if [ "$RW_BOOTSTRAP_FETCH_FAILED" = "1" ]; then
-    echo "- fetch-evidence: class=${RW_BOOTSTRAP_FETCH_LAST_ERROR_CLASS}; file=${RW_BOOTSTRAP_FETCH_LAST_ERROR_FILE}; url=${RW_BOOTSTRAP_FETCH_LAST_ERROR_URL}; curl_exit=${RW_BOOTSTRAP_FETCH_LAST_ERROR_CODE}; attempts=${RW_BOOTSTRAP_FETCH_LAST_ERROR_ATTEMPTS}; strategy=${RW_BOOTSTRAP_FETCH_STRATEGY_MARKERS}"
+    echo "- fetch-evidence: class=${RW_BOOTSTRAP_FETCH_LAST_ERROR_CLASS}; file=${RW_BOOTSTRAP_FETCH_LAST_ERROR_FILE}; url=${RW_BOOTSTRAP_FETCH_LAST_ERROR_URL}; tool=${RW_BOOTSTRAP_FETCH_LAST_ERROR_TOOL}; tool_exit=${RW_BOOTSTRAP_FETCH_LAST_ERROR_CODE}; attempts=${RW_BOOTSTRAP_FETCH_LAST_ERROR_ATTEMPTS}; strategy=${RW_BOOTSTRAP_FETCH_STRATEGY_MARKERS}"
   fi
   echo "- snapshot: ${BEFORE_SNAPSHOT_STATUS}"
   echo "- diagnostics: ${BEFORE_DIAG_STATUS}"
