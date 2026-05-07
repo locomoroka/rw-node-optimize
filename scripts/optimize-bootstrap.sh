@@ -10,6 +10,7 @@ EXIT_USAGE=2
 ASSUME_YES=0
 DRY_RUN=0
 DEBUG_MODE=0
+FORCE_IPV6=0
 SPEED_NORMALIZED=""
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -26,7 +27,8 @@ RW_BOOTSTRAP_APPLY_TARGET="${RW_BOOTSTRAP_APPLY_TARGET:-all}"
 RW_BOOTSTRAP_SAMPLE_SECONDS="${RW_BOOTSTRAP_SAMPLE_SECONDS:-1}"
 RW_BOOTSTRAP_FETCH_RETRIES="${RW_BOOTSTRAP_FETCH_RETRIES:-3}"
 RW_BOOTSTRAP_FETCH_RETRY_DELAY="${RW_BOOTSTRAP_FETCH_RETRY_DELAY:-2}"
-RW_BOOTSTRAP_FETCH_FORCE_IPV4="${RW_BOOTSTRAP_FETCH_FORCE_IPV4:-0}"
+RW_BOOTSTRAP_FETCH_FORCE_IPV4="${RW_BOOTSTRAP_FETCH_FORCE_IPV4:-1}"
+RW_BOOTSTRAP_FETCH_FORCE_IPV6="${RW_BOOTSTRAP_FETCH_FORCE_IPV6:-0}"
 RW_BOOTSTRAP_FETCH_CURL_ARGS="${RW_BOOTSTRAP_FETCH_CURL_ARGS:-}"
 RW_BOOTSTRAP_FETCH_CURL_ARGS_REDACT="${RW_BOOTSTRAP_FETCH_CURL_ARGS_REDACT:-token,password,passwd,authorization,bearer,key,secret}"
 RW_BOOTSTRAP_FETCH_LAST_ERROR_CLASS=""
@@ -62,14 +64,15 @@ usage() {
   cat <<'EOF'
 Usage:
   scripts/optimize-bootstrap.sh --help
-  scripts/optimize-bootstrap.sh --yes [--speed <mbit>] [--debug]
-  scripts/optimize-bootstrap.sh --dry-run [--speed <mbit>] [--debug]
+  scripts/optimize-bootstrap.sh --yes [--speed <mbit>] [--debug] [--ipv6]
+  scripts/optimize-bootstrap.sh --dry-run [--speed <mbit>] [--debug] [--ipv6]
 
 Options:
   --yes             Non-interactive apply mode.
   --dry-run         Diagnostics/snapshots only; no mutating apply.
   --speed <value>   Per-user CAKE shaping speed (examples: 50, 50mbit, 500kbit, 1gbit).
   --debug           Print extended DEBUG diagnostics section after WHAT NEXT.
+  --ipv6            Force IPv6-only fetch mode (default is IPv4-only with -4).
   --help, -h        Show this help.
 
 Validation rules:
@@ -77,6 +80,7 @@ Validation rules:
   - --yes and --dry-run together are invalid.
   - --speed requires a non-empty value and valid unit format.
   - --debug may be combined with --yes or --dry-run.
+  - --ipv6 may be combined with --yes or --dry-run; overrides default IPv4 mode.
 
 Environment overrides:
   RW_BOOTSTRAP_BASE_URL          Base URL/path for payload files (default: rw-node-optimize/main raw).
@@ -139,10 +143,12 @@ reset_fetch_error_state() {
 
 configure_fetch_strategy_markers() {
   local markers=()
-  if [ "$RW_BOOTSTRAP_FETCH_FORCE_IPV4" = "1" ]; then
+  if [ "$FORCE_IPV6" = "1" ]; then
+    markers+=("ipv6-enabled")
+  elif [ "$RW_BOOTSTRAP_FETCH_FORCE_IPV4" = "1" ]; then
     markers+=("ipv4-enabled")
   else
-    markers+=("ipv4-disabled")
+    markers+=("dual-stack")
   fi
 
   if [ -n "$RW_BOOTSTRAP_FETCH_CURL_ARGS" ]; then
@@ -265,6 +271,9 @@ parse_args() {
       --debug)
         DEBUG_MODE=1
         ;;
+      --ipv6)
+        FORCE_IPV6=1
+        ;;
       *)
         log_error "Unknown argument: $1"
         usage >&2
@@ -319,7 +328,9 @@ download_file() {
     return 0
   fi
 
-  if [ "$RW_BOOTSTRAP_FETCH_FORCE_IPV4" = "1" ]; then
+  if [ "$FORCE_IPV6" = "1" ]; then
+    curl_cmd+=(-6)
+  elif [ "$RW_BOOTSTRAP_FETCH_FORCE_IPV4" = "1" ]; then
     curl_cmd+=(-4)
   fi
 
@@ -646,8 +657,8 @@ print_report() {
 
   echo "- verify: inspect ${RUN_DIR}/snapshot-result.log and rerun diagnostics with ./scripts/diag.sh after reboot/restart."
   if [ "$RW_BOOTSTRAP_FETCH_FAILED" = "1" ]; then
-    echo "- rerun-network: RW_BOOTSTRAP_FETCH_FORCE_IPV4=1 RW_BOOTSTRAP_FETCH_RETRIES=${RW_BOOTSTRAP_FETCH_RETRIES} RW_BOOTSTRAP_FETCH_RETRY_DELAY=${RW_BOOTSTRAP_FETCH_RETRY_DELAY} bash scripts/optimize-bootstrap.sh --dry-run"
-    echo "- rerun-network-custom: RW_BOOTSTRAP_FETCH_CURL_ARGS='<curl args>' bash scripts/optimize-bootstrap.sh --dry-run"
+    echo "- rerun-network: RW_BOOTSTRAP_FETCH_RETRIES=${RW_BOOTSTRAP_FETCH_RETRIES} RW_BOOTSTRAP_FETCH_RETRY_DELAY=${RW_BOOTSTRAP_FETCH_RETRY_DELAY} bash scripts/optimize-bootstrap.sh --dry-run"
+    echo "- rerun-network-ipv6: bash scripts/optimize-bootstrap.sh --dry-run --ipv6"
   fi
   if [ -n "$TX_ID" ]; then
     echo "- rollback: ./scripts/optimize.sh --rollback ${TX_ID}"
