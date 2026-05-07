@@ -510,6 +510,8 @@ extract_tx_id() {
 
 run_before() {
   local label="one-liner ${RUN_ID} BEFORE"
+  log_info "Collecting BEFORE statistics (snapshot + diagnostics)..."
+  log_info "Snapshot sampling window: ${RW_BOOTSTRAP_SAMPLE_SECONDS} second(s)"
   if RW_BA_STATE_DIR="${RUN_DIR}/snapshots" RW_BA_SAMPLE_SECONDS="$RW_BOOTSTRAP_SAMPLE_SECONDS" run_capture before-snapshot bash "${WORKDIR}/scripts/snapshot.sh" before "$label"; then
     BEFORE_SNAPSHOT_STATUS="ok"
   else
@@ -540,6 +542,7 @@ run_apply() {
   if [ "$DRY_RUN" -eq 1 ]; then
     APPLY_STATUS="skipped"
     APPLY_DETAIL="dry-run: mutating optimize.sh apply was not executed"
+    log_info "Skipping apply (dry-run mode)"
     {
       echo "dry-run: skipped command: ${apply_cmd[*]}"
       if [ -n "$SPEED_NORMALIZED" ]; then
@@ -549,6 +552,7 @@ run_apply() {
     return 0
   fi
 
+  log_info "Applying optimizations..."
   if printf 'Yes\n' | "${apply_cmd[@]}" >"$apply_log" 2>&1; then
     TX_ID="$(extract_tx_id "$apply_log")"
     if grep -Eiq 'no-op apply|already match|already-ok' "$apply_log"; then
@@ -572,6 +576,7 @@ run_apply() {
 
 run_after() {
   local label="one-liner ${RUN_ID} AFTER"
+  log_info "Collecting AFTER statistics (diagnostics + snapshot)..."
   if run_capture after-diag bash "${WORKDIR}/scripts/diag.sh"; then
     AFTER_DIAG_STATUS="ok"
   else
@@ -579,6 +584,7 @@ run_after() {
     mark_runtime_failure
   fi
 
+  log_info "Snapshot sampling window: ${RW_BOOTSTRAP_SAMPLE_SECONDS} second(s)"
   if RW_BA_STATE_DIR="${RUN_DIR}/snapshots" RW_BA_SAMPLE_SECONDS="$RW_BOOTSTRAP_SAMPLE_SECONDS" run_capture after-snapshot bash "${WORKDIR}/scripts/snapshot.sh" after "$label"; then
     AFTER_SNAPSHOT_STATUS="ok"
   else
@@ -586,6 +592,7 @@ run_after() {
     mark_runtime_failure
   fi
 
+  log_info "Computing snapshot diff..."
   if RW_BA_STATE_DIR="${RUN_DIR}/snapshots" RW_BA_SAMPLE_SECONDS="$RW_BOOTSTRAP_SAMPLE_SECONDS" run_capture snapshot-result bash "${WORKDIR}/scripts/snapshot.sh" result; then
     SNAPSHOT_RESULT_STATUS="ok"
   else
