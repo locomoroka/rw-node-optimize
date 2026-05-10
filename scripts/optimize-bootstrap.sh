@@ -505,27 +505,29 @@ verify_version() {
 
 verify_manifest() {
   local manifest="${WORKDIR}/manifest.sha256"
+  local out=""
+  local st=0
 
   if command -v sha256sum >/dev/null 2>&1; then
-    (
-      cd "$WORKDIR" || exit 1
-      sha256sum -c "$manifest" --status
-    ) || {
-      log_error "Checksum verification failed against manifest.sha256"
-      return 1
-    }
-    return 0
+    out="$(cd "$WORKDIR" && sha256sum -c "$manifest" 2>&1)" || st=$?
+    [ "$st" -eq 0 ] && return 0
+    log_error "Checksum verification failed against manifest.sha256"
+    while IFS= read -r line; do
+      [ -n "$line" ] && log_error "  $line"
+    done <<< "$out"
+    log_error "Hint: remote manifest does not match downloaded files (partial publish). Maintainer: republish full payload from the dev repo; before push run scripts/verify-published.sh there."
+    return 1
   fi
 
   if command -v shasum >/dev/null 2>&1; then
-    (
-      cd "$WORKDIR" || exit 1
-      shasum -a 256 -c "$manifest" --status
-    ) || {
-      log_error "Checksum verification failed against manifest.sha256"
-      return 1
-    }
-    return 0
+    out="$(cd "$WORKDIR" && shasum -a 256 -c "$manifest" 2>&1)" || st=$?
+    [ "$st" -eq 0 ] && return 0
+    log_error "Checksum verification failed against manifest.sha256"
+    while IFS= read -r line; do
+      [ -n "$line" ] && log_error "  $line"
+    done <<< "$out"
+    log_error "Hint: remote manifest does not match downloaded files (partial publish). Maintainer: republish full payload from the dev repo; before push run scripts/verify-published.sh there."
+    return 1
   fi
 
   log_error "No SHA-256 verifier found (need sha256sum or shasum)"
