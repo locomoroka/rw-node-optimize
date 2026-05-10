@@ -2,6 +2,13 @@
 
 Default bootstrap work directory: **`/opt/remnawave-tools/oneliner`**. Remote installs need **`sudo`** so that path can be created under `/opt`.
 
+### Modes
+
+- **`--yes`** — non-interactive apply; bootstrap feeds confirmation only into the internal `optimize.sh` apply prompt.
+- **`--dry-run`** — runs snapshot/diagnostics/report without mutating apply; `APPLIED` records `skipped`.
+- **`--speed <value>`** — forwards shaping to the CAKE apply path (for example `50` → `50mbit`).
+- **`--debug`** — adds an extended `=== DEBUG ===` section at the end of stdout; does not change apply logic.
+
 **Apply (non-interactive):**
 
 ```bash
@@ -14,7 +21,7 @@ curl -fsSL https://raw.githubusercontent.com/locomoroka/rw-node-optimize/main/sc
 curl -fsSL https://raw.githubusercontent.com/locomoroka/rw-node-optimize/main/scripts/optimize-bootstrap.sh | sudo bash -s -- --dry-run
 ```
 
-Pass more arguments after `--` (for example `--speed 50`, `--debug`, `--ipv6`).
+Pass more arguments after `--` (for example `--speed 50`, `--debug`, `--ipv6`). See **Modes** above.
 
 ### Verified payload (download then run locally)
 
@@ -51,11 +58,4 @@ Example with DNS pin:
 ```bash
 RW_BOOTSTRAP_FETCH_CURL_ARGS="--resolve raw.githubusercontent.com:443:185.199.108.133 --connect-timeout 10 --retry 3" \
 curl -fsSL https://raw.githubusercontent.com/locomoroka/rw-node-optimize/main/scripts/optimize-bootstrap.sh | sudo bash -s -- --dry-run
-```
-
-### Publish from Windows
-
-```bat
-scripts\publish.bat ..\rw-node-optimize --dry-run
-scripts\publish.bat ..\rw-node-optimize --push
 ```
