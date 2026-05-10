@@ -4,6 +4,14 @@
 
 The default bootstrap work directory is `/opt/remnawave-tools/oneliner`. **Remote one-liner** examples below use **`sudo`** so that directory can be created under `/opt`. When running from a **local clone** with `RW_BOOTSTRAP_BASE_URL="$PWD"`, you may omit `sudo` if you set **`RW_BOOTSTRAP_WORKDIR`** to a writable path (or create it beforehand).
 
+If `sudo bash <(curl …)` fails with **`bash: /dev/fd/N: No such file or directory`** (some hosts break process substitution under `sudo`), use streaming instead — equivalent behavior:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/locomoroka/rw-node-optimize/main/scripts/optimize-bootstrap.sh | sudo bash -s -- --yes
+```
+
+Swap `--yes` for `--dry-run` or add flags as needed after `--`.
+
 ### One-liner apply
 
 ```bash

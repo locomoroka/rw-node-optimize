@@ -13,8 +13,6 @@ DEBUG_MODE=0
 FORCE_IPV6=0
 SPEED_NORMALIZED=""
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 WORKDIR_BASE="${RW_BOOTSTRAP_WORKDIR:-/opt/remnawave-tools/oneliner}"
 WORKDIR=""
 RUN_ID=""
