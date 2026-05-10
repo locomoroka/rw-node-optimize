@@ -15,7 +15,7 @@ SPEED_NORMALIZED=""
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-WORKDIR_BASE="${RW_BOOTSTRAP_WORKDIR:-/tmp/rw-oneliner}"
+WORKDIR_BASE="${RW_BOOTSTRAP_WORKDIR:-/opt/remnawave-tools/oneliner}"
 WORKDIR=""
 RUN_ID=""
 RUN_DIR=""
@@ -88,7 +88,7 @@ Validation rules:
 Environment overrides:
   RW_BOOTSTRAP_BASE_URL          Base URL/path for payload files (default: rw-node-optimize/main raw).
   RW_BOOTSTRAP_VERSION_EXPECTED  Optional pinned VERSION value to enforce.
-  RW_BOOTSTRAP_WORKDIR           Optional local workdir (default: /tmp/rw-oneliner).
+  RW_BOOTSTRAP_WORKDIR           Optional local workdir (default: /opt/remnawave-tools/oneliner).
   RW_BOOTSTRAP_APPLY_TARGET      scripts/optimize.sh --apply target (default: all).
   RW_BOOTSTRAP_SAMPLE_SECONDS    Snapshot sampling window for bootstrap runs (default: 1).
   RW_BOOTSTRAP_FETCH_TOOL        Fetch tool mode: auto|curl|wget (default: auto).
