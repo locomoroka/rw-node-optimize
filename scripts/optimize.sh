@@ -33,6 +33,8 @@ ALLOWED_ZONES="${ZONE_ORDER[*]}"
 
 CLI_MODE=""
 APPLY_TARGET_RAW=""
+# Set by normalize_selected_zones: 1 if --apply list explicitly names docker-daemon (not from bare "all").
+DOCKER_DAEMON_EXPLICITLY_SELECTED=0
 ROLLBACK_TX_ID=""
 VERIFY_TX_ID=""
 SELECTED_ZONES=()
@@ -85,6 +87,11 @@ COMPOSE_CANDIDATE_PATHS=(
     "/opt/remnanode/docker-compose.yml"
     "/vless/docker-compose.yml"
     "/vless/remnanode/docker-compose.yml"
+)
+# After successful --apply: `docker compose up -d` for each existing file. Disable with RW_OPT_COMPOSE_ENSURE_UP=0.
+COMPOSE_ENSURE_STACK_PATHS=(
+    "/opt/remnanode/docker-compose.yml"
+    "/opt/remnanode/selfsteal/docker-compose.yml"
 )
 COMPOSE_SERVICE_NAME="remnanode"
 COMPOSE_CONTAINER_NAME="remnanode"
@@ -1757,6 +1764,7 @@ run_verify_reboot_last_mode_final() {
 
 maybe_record_startup_artifacts_in_op() {
     local zone="$1"
+    [ "$ZONE_OUTCOME_STATUS" = "skipped" ] && return 0
     case "$zone" in
         docker-daemon) record_startup_artifact_docker_daemon ;;
         compose) record_startup_artifact_compose ;;
@@ -2027,6 +2035,7 @@ verify_finalize_result() {
 
 record_apply_zone_startup_metadata() {
     local zone="$1"
+    [ "$ZONE_OUTCOME_STATUS" = "skipped" ] && return 0
     case "$zone" in
         docker-daemon) record_startup_artifact_docker_daemon ;;
         compose) record_startup_artifact_compose ;;
@@ -3211,6 +3220,11 @@ State root:
   RW_OPT_STATE_DIR overrides the transaction state directory root.
   Default: ${DEFAULT_STATE_ROOT}
 
+Docker daemon (/etc/docker/daemon.json):
+  By default the docker-daemon zone is NOT run for --apply all (only compose sysctl/limits/etc.).
+  RW_OPT_SKIP_DOCKER_DAEMON=0 includes docker-daemon in --apply all.
+  Or pass docker-daemon in the zone list (e.g. --apply sysctl,compose,docker-daemon).
+
 Test mode:
   RW_OPT_TEST_MODE=1 makes apply deterministic and non-mutating.
   RW_OPT_TEST_TX_ID overrides generated tx-id in test mode only.
@@ -3264,6 +3278,8 @@ normalize_selected_zones() {
     local -a raw_parts=()
     local raw="$1"
 
+    DOCKER_DAEMON_EXPLICITLY_SELECTED=0
+
     if [ -z "$raw" ]; then
         log_error "Missing required target for --apply"
         usage >&2
@@ -3272,6 +3288,15 @@ normalize_selected_zones() {
 
     if [ "$raw" = "all" ]; then
         SELECTED_ZONES=("${ZONE_ORDER[@]}")
+        if [ "${RW_OPT_SKIP_DOCKER_DAEMON:-1}" != "0" ]; then
+            local -a filtered=()
+            local z
+            for z in "${SELECTED_ZONES[@]}"; do
+                [ "$z" = "docker-daemon" ] && continue
+                filtered+=("$z")
+            done
+            SELECTED_ZONES=("${filtered[@]}")
+        fi
     else
         if [[ "$raw" == *, || "$raw" == ,* || "$raw" == *,,* ]]; then
             log_error "Malformed --apply target list: $raw"
@@ -3298,6 +3323,10 @@ normalize_selected_zones() {
                 echo "Allowed zones: ${ALLOWED_ZONES}" >&2
                 usage >&2
                 exit 2
+            fi
+
+            if [ "$zone" = "docker-daemon" ]; then
+                DOCKER_DAEMON_EXPLICITLY_SELECTED=1
             fi
 
             if list_contains "$zone" "${parsed[@]}"; then
@@ -3824,6 +3853,12 @@ preview_plan() {
         echo "TEST_MODE: enabled (non-mutating apply path)"
     fi
 
+    if ! list_contains "docker-daemon" "${SELECTED_ZONES[@]}"; then
+        echo "docker-daemon zone omitted (default for --apply all): ${DOCKER_CONFIG} will not be modified."
+        echo "  To include: RW_OPT_SKIP_DOCKER_DAEMON=0 with --apply all, or add docker-daemon to the zone list."
+        echo
+    fi
+
     echo "Paths that would be touched in apply mode:"
     echo "  ${SYSCTL_CONFIG}"
     echo "  ${LIMITS_CONFIG}"
@@ -3834,6 +3869,14 @@ preview_plan() {
     echo "  ${MODULES_LOAD_BBR}"
     echo "  ${CURRENT_TX_DIR:-<tx-dir>}/backups/<zone>/..."
     echo
+    if [ "${RW_OPT_COMPOSE_ENSURE_UP:-1}" != "0" ]; then
+        echo "Post-apply: docker compose up -d for each of:"
+        local _cef
+        for _cef in "${COMPOSE_ENSURE_STACK_PATHS[@]}"; do
+            echo "  ${_cef} (if present)"
+        done
+        echo
+    fi
 }
 
 confirm_apply() {
@@ -4029,6 +4072,15 @@ apply_docker_daemon() {
     if ! capture_backup_metadata "$CURRENT_OP_PATH" "docker-daemon" "docker_daemon" "$DOCKER_CONFIG"; then
         return 1
     fi
+
+    if [ "${RW_OPT_SKIP_DOCKER_DAEMON:-1}" = "1" ] && [ "${DOCKER_DAEMON_EXPLICITLY_SELECTED:-0}" != "1" ]; then
+        journal_append_field "$CURRENT_OP_PATH" "state_capture_status" "skipped"
+        journal_append_field "$CURRENT_OP_PATH" "state_capture_reason" "RW_OPT_SKIP_DOCKER_DAEMON_default"
+        mark_zone_skipped "docker-daemon off by default (RW_OPT_SKIP_DOCKER_DAEMON=0 or explicit zone)"
+        log_warn "[docker-daemon] Skipped; ${DOCKER_CONFIG} not modified (no SIGHUP/reload)"
+        return 0
+    fi
+
     journal_append_field "$CURRENT_OP_PATH" "state_capture_status" "captured"
 
     local docker_was_active="0"
@@ -4179,6 +4231,38 @@ print('Patched')
         mark_zone_skipped "source compose file missing"
         log_warn "No existing docker-compose.yml found at ${EXISTING_COMPOSE}; skipping compose patch"
     fi
+}
+
+apply_compose_ensure_stacks_up() {
+    if [ "${RW_OPT_COMPOSE_ENSURE_UP:-1}" = "0" ]; then
+        return 0
+    fi
+
+    if is_test_mode; then
+        log_info "TEST_MODE: would run docker compose up -d for remnanode/selfsteal stacks"
+        return 0
+    fi
+
+    if ! command -v docker >/dev/null 2>&1; then
+        log_warn "[compose-ensure] docker CLI not found; skipping stack ensure"
+        return 0
+    fi
+
+    local compose_file any_run=0
+    for compose_file in "${COMPOSE_ENSURE_STACK_PATHS[@]}"; do
+        [ -f "$compose_file" ] && [ -s "$compose_file" ] || continue
+        any_run=1
+        log_info "[compose-ensure] docker compose up -d (${compose_file})"
+        if ! docker compose -f "$compose_file" up -d; then
+            log_error "[compose-ensure] docker compose up -d failed for ${compose_file}"
+            return 1
+        fi
+    done
+
+    if [ "$any_run" = "0" ]; then
+        log_info "[compose-ensure] no stack compose files present; skipped"
+    fi
+    return 0
 }
 
 apply_net_iface() {
@@ -4446,6 +4530,7 @@ run_apply_mode() {
 
     log_info "Applying selected zones: ${SELECTED_ZONES_CSV}"
     apply_flow_with_startup_tracking
+    apply_compose_ensure_stacks_up
     log_success "Apply phase finished for zones: ${SELECTED_ZONES_CSV}"
 }
 
