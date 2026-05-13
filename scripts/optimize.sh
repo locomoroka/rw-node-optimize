@@ -4200,14 +4200,18 @@ nofile['soft'] = max(soft, ${FD_SOFT})
 nofile['hard'] = max(hard, ${FD_HARD})
 if 'restart' not in svc:
     svc['restart'] = 'always'
-gomemlimit_mib = int(${CONTAINER_MEM_MB} * 0.7)
+gomemlimit_mib = int(${CONTAINER_MEM_MB} * 0.85)
 env = svc.setdefault('environment', {})
 if isinstance(env, list):
-    env = [e for e in env if not e.startswith('GOMEMLIMIT=')]
+    env = [e for e in env if not e.startswith(('GOMEMLIMIT=', 'GOGC=', 'GODEBUG='))]
     env.append('GOMEMLIMIT=' + str(gomemlimit_mib) + 'MiB')
+    env.append('GOGC=150')
+    env.append('GODEBUG=madvdontneed=1')
     svc['environment'] = env
 else:
     env['GOMEMLIMIT'] = str(gomemlimit_mib) + 'MiB'
+    env['GOGC'] = '150'
+    env['GODEBUG'] = 'madvdontneed=1'
 with open('${EXISTING_COMPOSE}', 'w') as f:
     yaml.dump(compose, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
 print('Patched')
