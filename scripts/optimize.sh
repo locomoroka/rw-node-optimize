@@ -3,11 +3,19 @@ set -euo pipefail
 
 #===============================================================================
 # RemnaWave Adaptive Optimization Script v3.1
-# Sysctl parameter fixes based on recomend.md audit (2026-05):
-#   - tcp_fin_timeout: 15→30 (high-RTT DPI clients, up to 3000ms)
+# Sysctl parameter fixes based on recomend.md audit and 2026-05-15 production incident:
+#   - tcp_fin_timeout: 30→15 (orphan-storm prevention under reconcile load >17K established)
 #   - nf_conntrack_tcp_timeout_established: 3600→1200 (conntrack table pressure)
+#   - nf_conntrack_tcp_timeout_time_wait: 30→15 (orphan-storm symmetry)
+#   - nf_conntrack_tcp_timeout_fin_wait: 30→15 (orphan-storm symmetry)
 #   - tcp_notsent_lowat: added 131072 (VLESS/Vision multiplexing latency)
-#   - tcp_max_orphans: added 65536 (OOM prevention during mass disconnects)
+#   - tcp_max_orphans: adaptive clamp(MEM_TOTAL_MB*32, 65536, 524288)
+#   - tcp_orphan_retries: added 3 (faster orphan pool release)
+# Compose environment patch:
+#   - GOGC=150 + GODEBUG=madvdontneed=1 injected
+#   - GOMEMLIMIT removed (Docker mem_limit is the hard cgroup ceiling; soft-ceiling Go
+#     runtime behavior prevented RSS from being returned to OS — see openspec
+#     2026-05-15-fix-orphan-storm-and-drop-gomemlimit)
 # Explicit contract:
 #   - no implicit mutation
 #   - must pass --apply <target>
@@ -69,6 +77,12 @@ SOMAXCONN=""
 SYN_BACKLOG=""
 NETDEV_BACKLOG=""
 RING_SIZE=""
+TCP_FIN_TIMEOUT=""
+CONNTRACK_ESTABLISHED=""
+TCP_NOTSENT_LOWAT=""
+TCP_MAX_ORPHANS=""
+TCP_ORPHAN_RETRIES=""
+SWAPPINESS=""
 
 SYSCTL_CONFIG="/etc/sysctl.d/99-remnawave-adaptive.conf"
 LIMITS_CONFIG="/etc/security/limits.d/99-remnawave-adaptive.conf"
@@ -122,7 +136,10 @@ get_managed_sysctl_params() {
     echo "net.ipv4.tcp_fin_timeout"
     echo "net.ipv4.tcp_notsent_lowat"
     echo "net.ipv4.tcp_max_orphans"
+    echo "net.ipv4.tcp_orphan_retries"
     echo "net.netfilter.nf_conntrack_tcp_timeout_established"
+    echo "net.netfilter.nf_conntrack_tcp_timeout_time_wait"
+    echo "net.netfilter.nf_conntrack_tcp_timeout_fin_wait"
     echo "net.core.rmem_max"
     echo "net.core.wmem_max"
     echo "net.ipv4.tcp_rmem"
@@ -317,7 +334,10 @@ is_zone_idempotent() {
             net.ipv4.tcp_fin_timeout)        target="${TCP_FIN_TIMEOUT}" ;;
             net.ipv4.tcp_notsent_lowat)      target="${TCP_NOTSENT_LOWAT}" ;;
             net.ipv4.tcp_max_orphans)        target="${TCP_MAX_ORPHANS}" ;;
+            net.ipv4.tcp_orphan_retries)     target="${TCP_ORPHAN_RETRIES}" ;;
             net.netfilter.nf_conntrack_tcp_timeout_established) target="${CONNTRACK_ESTABLISHED}" ;;
+            net.netfilter.nf_conntrack_tcp_timeout_time_wait) target="15" ;;
+            net.netfilter.nf_conntrack_tcp_timeout_fin_wait)  target="15" ;;
             net.core.rmem_max)               target="${TCP_RMEM_MAX}" ;;
             net.core.wmem_max)               target="${TCP_WMEM_MAX}" ;;
             net.ipv4.tcp_rmem)               target="4096 ${TCP_BUFFER_DEFAULT} ${TCP_RMEM_MAX}" ;;
@@ -3753,10 +3773,13 @@ calculate_parameters() {
         *) log_warn "Unknown RW_OPT_QDISC='${QDISC}', falling back to fq"; QDISC="fq" ;;
     esac
 
-    TCP_FIN_TIMEOUT=30
+    TCP_FIN_TIMEOUT=15
     CONNTRACK_ESTABLISHED=1200
     TCP_NOTSENT_LOWAT=131072
-    TCP_MAX_ORPHANS=65536
+    TCP_MAX_ORPHANS=$((MEM_TOTAL_MB * 32))
+    if [ "$TCP_MAX_ORPHANS" -gt 524288 ]; then TCP_MAX_ORPHANS=524288; fi
+    if [ "$TCP_MAX_ORPHANS" -lt 65536 ]; then TCP_MAX_ORPHANS=65536; fi
+    TCP_ORPHAN_RETRIES=3
     SWAPPINESS=1
 }
 
@@ -3790,7 +3813,8 @@ preview_plan() {
     echo "  tcp_fin_timeout:       ${TCP_FIN_TIMEOUT}"
     echo "  conntrack_established: ${CONNTRACK_ESTABLISHED}"
     echo "  tcp_notsent_lowat:     ${TCP_NOTSENT_LOWAT}"
-    echo "  tcp_max_orphans:       ${TCP_MAX_ORPHANS}"
+    echo "  tcp_max_orphans:       ${TCP_MAX_ORPHANS} (adaptive: MEM_TOTAL_MB*32, clamp [65536, 524288])"
+    echo "  tcp_orphan_retries:    ${TCP_ORPHAN_RETRIES}"
     echo "  swappiness:            ${SWAPPINESS}"
     echo "  qdisc:                 ${QDISC}"
     if [ -n "$SHAPING_BANDWIDTH" ]; then
@@ -3826,7 +3850,10 @@ preview_plan() {
                 net.ipv4.tcp_fin_timeout)        target="${TCP_FIN_TIMEOUT}" ;;
                 net.ipv4.tcp_notsent_lowat)      target="${TCP_NOTSENT_LOWAT}" ;;
                 net.ipv4.tcp_max_orphans)        target="${TCP_MAX_ORPHANS}" ;;
+                net.ipv4.tcp_orphan_retries)     target="${TCP_ORPHAN_RETRIES}" ;;
                 net.netfilter.nf_conntrack_tcp_timeout_established) target="${CONNTRACK_ESTABLISHED}" ;;
+                net.netfilter.nf_conntrack_tcp_timeout_time_wait) target="15" ;;
+                net.netfilter.nf_conntrack_tcp_timeout_fin_wait)  target="15" ;;
                 net.core.rmem_max)               target="${TCP_RMEM_MAX}" ;;
                 net.core.wmem_max)               target="${TCP_WMEM_MAX}" ;;
                 net.ipv4.tcp_rmem)               target="4096 ${TCP_BUFFER_DEFAULT} ${TCP_RMEM_MAX}" ;;
@@ -4000,12 +4027,13 @@ net.ipv4.tcp_congestion_control = bbr
 net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_notsent_lowat = ${TCP_NOTSENT_LOWAT}
 net.ipv4.tcp_max_orphans = ${TCP_MAX_ORPHANS}
+net.ipv4.tcp_orphan_retries = ${TCP_ORPHAN_RETRIES}
 net.ipv4.tcp_mtu_probing = 1
 net.ipv4.tcp_ecn = 1
 net.ipv4.tcp_ecn_fallback = 1
 net.netfilter.nf_conntrack_max = ${CONNTRACK_MAX}
-net.netfilter.nf_conntrack_tcp_timeout_time_wait = 30
-net.netfilter.nf_conntrack_tcp_timeout_fin_wait = 30
+net.netfilter.nf_conntrack_tcp_timeout_time_wait = 15
+net.netfilter.nf_conntrack_tcp_timeout_fin_wait = 15
 net.netfilter.nf_conntrack_tcp_timeout_close_wait = 15
 net.netfilter.nf_conntrack_tcp_timeout_established = ${CONNTRACK_ESTABLISHED}
 vm.swappiness = ${SWAPPINESS}
@@ -4200,16 +4228,14 @@ nofile['soft'] = max(soft, ${FD_SOFT})
 nofile['hard'] = max(hard, ${FD_HARD})
 if 'restart' not in svc:
     svc['restart'] = 'always'
-gomemlimit_mib = int(${CONTAINER_MEM_MB} * 0.85)
 env = svc.setdefault('environment', {})
 if isinstance(env, list):
     env = [e for e in env if not e.startswith(('GOMEMLIMIT=', 'GOGC=', 'GODEBUG='))]
-    env.append('GOMEMLIMIT=' + str(gomemlimit_mib) + 'MiB')
     env.append('GOGC=150')
     env.append('GODEBUG=madvdontneed=1')
     svc['environment'] = env
 else:
-    env['GOMEMLIMIT'] = str(gomemlimit_mib) + 'MiB'
+    env.pop('GOMEMLIMIT', None)
     env['GOGC'] = '150'
     env['GODEBUG'] = 'madvdontneed=1'
 with open('${EXISTING_COMPOSE}', 'w') as f:
