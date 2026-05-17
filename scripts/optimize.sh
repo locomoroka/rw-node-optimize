@@ -9,13 +9,14 @@ set -euo pipefail
 #   - nf_conntrack_tcp_timeout_time_wait: 30→15 (orphan-storm symmetry)
 #   - nf_conntrack_tcp_timeout_fin_wait: 30→15 (orphan-storm symmetry)
 #   - tcp_notsent_lowat: added 131072 (VLESS/Vision multiplexing latency)
-#   - tcp_max_orphans: adaptive clamp(MEM_TOTAL_MB*32, 65536, 524288)
+#   - tcp_max_orphans: adaptive clamp(MEM_TOTAL_MB*64, 65536, 1048576)
 #   - tcp_orphan_retries: added 3 (faster orphan pool release)
-# Compose environment patch:
+# Compose environment patch (default profile, no RW_OPT_GC_PROFILE):
 #   - GOGC=150 + GODEBUG=madvdontneed=1 injected
-#   - GOMEMLIMIT removed (Docker mem_limit is the hard cgroup ceiling; soft-ceiling Go
-#     runtime behavior prevented RSS from being returned to OS — see openspec
-#     2026-05-15-fix-orphan-storm-and-drop-gomemlimit)
+#   - GOMEMLIMIT removed (Docker mem_limit is the hard cgroup ceiling)
+# RW_OPT_GC_PROFILE=conservative:
+#   - GOMEMLIMIT = (CONTAINER_MEM_MB - 1500) / 100 * 100 MiB, GOGC=100
+#   - guard: if CONTAINER_MEM_MB - 1500 < 1024 → skip GOMEMLIMIT (warn + degrade)
 # Explicit contract:
 #   - no implicit mutation
 #   - must pass --apply <target>
@@ -3776,11 +3777,46 @@ calculate_parameters() {
     TCP_FIN_TIMEOUT=15
     CONNTRACK_ESTABLISHED=1200
     TCP_NOTSENT_LOWAT=131072
-    TCP_MAX_ORPHANS=$((MEM_TOTAL_MB * 32))
-    if [ "$TCP_MAX_ORPHANS" -gt 524288 ]; then TCP_MAX_ORPHANS=524288; fi
+    TCP_MAX_ORPHANS=$((MEM_TOTAL_MB * 64))
+    if [ "$TCP_MAX_ORPHANS" -gt 1048576 ]; then TCP_MAX_ORPHANS=1048576; fi
     if [ "$TCP_MAX_ORPHANS" -lt 65536 ]; then TCP_MAX_ORPHANS=65536; fi
     TCP_ORPHAN_RETRIES=3
     SWAPPINESS=1
+
+    # GC profile: controls Go runtime env vars (GOMEMLIMIT, GOGC) in apply_compose()
+    GC_PROFILE="${RW_OPT_GC_PROFILE:-}"
+    case "$GC_PROFILE" in
+        ""|default)
+            GC_PROFILE="default"
+            GOGC_VALUE="150"
+            GOMEMLIMIT_MIB=""
+            ;;
+        conservative)
+            GOGC_VALUE="100"
+            GOMEMLIMIT_HEADROOM=$((CONTAINER_MEM_MB - 1500))
+            if [ "$GOMEMLIMIT_HEADROOM" -lt 1024 ]; then
+                log_warn "Container memory ${CONTAINER_MEM_MB}MB too small for conservative GC profile (headroom=${GOMEMLIMIT_HEADROOM}MB < 1024MB); GOMEMLIMIT will NOT be set, GOGC=100 still applies"
+                GOMEMLIMIT_MIB=""
+            else
+                GOMEMLIMIT_MIB=$((GOMEMLIMIT_HEADROOM / 100 * 100))
+            fi
+            ;;
+        *)
+            log_warn "Unknown RW_OPT_GC_PROFILE='${GC_PROFILE}'; falling back to default profile"
+            GC_PROFILE="default"
+            GOGC_VALUE="150"
+            GOMEMLIMIT_MIB=""
+            ;;
+    esac
+
+    # Build Python code snippets for apply_compose() GOMEMLIMIT injection
+    if [ -n "$GOMEMLIMIT_MIB" ]; then
+        GOMEMLIMIT_LIST_ENTRY="    env.append('GOMEMLIMIT=${GOMEMLIMIT_MIB}MiB')"
+        GOMEMLIMIT_DICT_ENTRY="    env['GOMEMLIMIT'] = '${GOMEMLIMIT_MIB}MiB'"
+    else
+        GOMEMLIMIT_LIST_ENTRY=""
+        GOMEMLIMIT_DICT_ENTRY=""
+    fi
 }
 
 preview_plan() {
@@ -3813,9 +3849,15 @@ preview_plan() {
     echo "  tcp_fin_timeout:       ${TCP_FIN_TIMEOUT}"
     echo "  conntrack_established: ${CONNTRACK_ESTABLISHED}"
     echo "  tcp_notsent_lowat:     ${TCP_NOTSENT_LOWAT}"
-    echo "  tcp_max_orphans:       ${TCP_MAX_ORPHANS} (adaptive: MEM_TOTAL_MB*32, clamp [65536, 524288])"
+    echo "  tcp_max_orphans:       ${TCP_MAX_ORPHANS} (adaptive: MEM_TOTAL_MB*64, clamp [65536, 1048576])"
     echo "  tcp_orphan_retries:    ${TCP_ORPHAN_RETRIES}"
     echo "  swappiness:            ${SWAPPINESS}"
+    echo "  gc_profile:            ${GC_PROFILE} (GOGC=${GOGC_VALUE})"
+    if [ -n "$GOMEMLIMIT_MIB" ]; then
+        echo "  gomemlimit:            ${GOMEMLIMIT_MIB} MiB (headroom=container_mem - 1500MB)"
+    else
+        echo "  gomemlimit:            (not set)"
+    fi
     echo "  qdisc:                 ${QDISC}"
     if [ -n "$SHAPING_BANDWIDTH" ]; then
         echo "  shaping:               ${SHAPING_BANDWIDTH} per-flow (CAKE flowblind)"
@@ -4229,15 +4271,20 @@ nofile['hard'] = max(hard, ${FD_HARD})
 if 'restart' not in svc:
     svc['restart'] = 'always'
 env = svc.setdefault('environment', {})
+if env is None:
+    env = {}
+    svc['environment'] = env
 if isinstance(env, list):
     env = [e for e in env if not e.startswith(('GOMEMLIMIT=', 'GOGC=', 'GODEBUG='))]
-    env.append('GOGC=150')
+    env.append('GOGC=${GOGC_VALUE}')
     env.append('GODEBUG=madvdontneed=1')
+${GOMEMLIMIT_LIST_ENTRY}
     svc['environment'] = env
 else:
     env.pop('GOMEMLIMIT', None)
-    env['GOGC'] = '150'
+    env['GOGC'] = '${GOGC_VALUE}'
     env['GODEBUG'] = 'madvdontneed=1'
+${GOMEMLIMIT_DICT_ENTRY}
 with open('${EXISTING_COMPOSE}', 'w') as f:
     yaml.dump(compose, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
 print('Patched')
