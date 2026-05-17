@@ -15,6 +15,14 @@ Default bootstrap work directory: **`/opt/remnawave-tools/oneliner`**. Remote in
 curl -fsSL https://raw.githubusercontent.com/locomoroka/rw-node-optimize/main/scripts/optimize-bootstrap.sh | sudo bash -s -- --yes
 ```
 
+**Apply with conservative GC profile (RW_OPT_GC_PROFILE):**
+
+```bash
+RW_OPT_GC_PROFILE=conservative bash -c "$(curl -fsSL https://raw.githubusercontent.com/locomoroka/rw-node-optimize/main/scripts/optimize-bootstrap.sh)" -- --yes
+```
+
+> `VAR=value` — обязательный префикс (без `;`). `curl ... | sudo bash -s` не подходит — `sudo` вырезает переменные окружения.
+
 **Dry-run (no mutating apply):**
 
 ```bash
