@@ -137,6 +137,9 @@ get_managed_sysctl_params() {
     echo "net.core.default_qdisc"
     echo "net.ipv4.tcp_congestion_control"
     echo "net.ipv4.tcp_fin_timeout"
+    echo "net.ipv4.tcp_keepalive_time"
+    echo "net.ipv4.tcp_keepalive_intvl"
+    echo "net.ipv4.tcp_keepalive_probes"
     echo "net.ipv4.tcp_notsent_lowat"
     echo "net.ipv4.tcp_max_orphans"
     echo "net.ipv4.tcp_orphan_retries"
@@ -335,6 +338,9 @@ is_zone_idempotent() {
             net.core.default_qdisc)          target="${QDISC}" ;;
             net.ipv4.tcp_congestion_control) target="bbr" ;;
             net.ipv4.tcp_fin_timeout)        target="${TCP_FIN_TIMEOUT}" ;;
+            net.ipv4.tcp_keepalive_time)     target="300" ;;
+            net.ipv4.tcp_keepalive_intvl)    target="30" ;;
+            net.ipv4.tcp_keepalive_probes)   target="3" ;;
             net.ipv4.tcp_notsent_lowat)      target="${TCP_NOTSENT_LOWAT}" ;;
             net.ipv4.tcp_max_orphans)        target="${TCP_MAX_ORPHANS}" ;;
             net.ipv4.tcp_orphan_retries)     target="${TCP_ORPHAN_RETRIES}" ;;
@@ -3952,6 +3958,7 @@ preview_plan() {
     echo "  file descriptors:      ${FD_SOFT}/${FD_HARD}"
     echo "  tcp buffer max:        ${TCP_RMEM_MAX}"
     echo "  tcp_fin_timeout:       ${TCP_FIN_TIMEOUT}"
+    echo "  tcp_keepalive_time:    300"
     echo "  conntrack_established: ${CONNTRACK_ESTABLISHED}"
     echo "  tcp_notsent_lowat:     ${TCP_NOTSENT_LOWAT}"
     echo "  tcp_max_orphans:       ${TCP_MAX_ORPHANS} (adaptive: MEM_TOTAL_MB*64, clamp [65536, 1048576])"
@@ -4162,7 +4169,7 @@ net.ipv4.tcp_syncookies = 1
 net.ipv4.tcp_synack_retries = 2
 net.ipv4.tcp_syn_retries = 2
 net.ipv4.tcp_fin_timeout = ${TCP_FIN_TIMEOUT}
-net.ipv4.tcp_keepalive_time = 600
+net.ipv4.tcp_keepalive_time = 300
 net.ipv4.tcp_keepalive_intvl = 30
 net.ipv4.tcp_keepalive_probes = 3
 net.ipv4.tcp_tw_reuse = 1
