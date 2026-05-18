@@ -15,10 +15,16 @@ Default bootstrap work directory: **`/opt/remnawave-tools/oneliner`**. Remote in
 curl -fsSL https://raw.githubusercontent.com/locomoroka/rw-node-optimize/main/scripts/optimize-bootstrap.sh | sudo bash -s -- --yes
 ```
 
-**Apply with conservative GC profile (RW_OPT_GC_PROFILE):**
+**Apply with explicit conservative GC profile (same as current default):**
 
 ```bash
 RW_OPT_GC_PROFILE=conservative bash -c "$(curl -fsSL https://raw.githubusercontent.com/locomoroka/rw-node-optimize/main/scripts/optimize-bootstrap.sh)" -- --yes
+```
+
+**Apply with fallback GC profile (legacy opt-out):**
+
+```bash
+RW_OPT_GC_PROFILE=fallback bash -c "$(curl -fsSL https://raw.githubusercontent.com/locomoroka/rw-node-optimize/main/scripts/optimize-bootstrap.sh)" -- --yes
 ```
 
 > `VAR=value` — обязательный префикс (без `;`). `curl ... | sudo bash -s` не подходит — `sudo` вырезает переменные окружения.
@@ -51,15 +57,22 @@ With `RW_BOOTSTRAP_WORKDIR` pointing at a writable directory you can run without
 
 Successful runs print **BEFORE**, **APPLIED**, **AFTER**, **WHAT NEXT** in that order. `--debug` adds a **DEBUG** section after **WHAT NEXT**.
 
-### Network / fetch tuning
+### Bootstrap variables
 
 | Variable | Purpose |
 |---|---|
-| `RW_BOOTSTRAP_FETCH_TOOL` | `auto`, `curl`, or `wget` |
-| `RW_BOOTSTRAP_FETCH_FORCE_IPV4` | default `1` (IPv4-only curl `-4`) |
-| `RW_BOOTSTRAP_FETCH_FORCE_IPV6` | set `1` with `--ipv6` for IPv6-only |
-| `RW_BOOTSTRAP_FETCH_CURL_ARGS` | Extra curl arguments |
+| `RW_BOOTSTRAP_WORKDIR` | Work directory for downloaded payload (default `/opt/remnawave-tools/oneliner`) |
+| `RW_BOOTSTRAP_BASE_URL` | Base URL/path for payload files |
+| `RW_BOOTSTRAP_VERSION_EXPECTED` | Optional pinned `VERSION` check |
+| `RW_BOOTSTRAP_APPLY_TARGET` | Forwards target to `optimize.sh --apply` (default `all`) |
+| `RW_BOOTSTRAP_SAMPLE_SECONDS` | Snapshot sampling window for bootstrap runs (default `1`) |
+| `RW_BOOTSTRAP_FETCH_TOOL` | Fetch mode: `auto`, `curl`, or `wget` |
+| `RW_BOOTSTRAP_FETCH_FORCE_IPV4` | Default `1` (IPv4-only curl `-4`) |
+| `RW_BOOTSTRAP_FETCH_FORCE_IPV6` | Set `1` or use `--ipv6` for IPv6-only |
 | `RW_BOOTSTRAP_FETCH_RETRIES` | Retries per file (default `3`) |
+| `RW_BOOTSTRAP_FETCH_RETRY_DELAY` | Delay between retries in seconds (default `2`) |
+| `RW_BOOTSTRAP_FETCH_CURL_ARGS` | Extra curl arguments |
+| `RW_BOOTSTRAP_FETCH_WGET_ARGS` | Extra wget arguments |
 
 Example with DNS pin:
 

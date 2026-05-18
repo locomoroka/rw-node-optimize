@@ -12,10 +12,12 @@ set -euo pipefail
 #   - tcp_max_orphans: adaptive clamp(MEM_TOTAL_MB*64, 65536, 1048576)
 #   - tcp_orphan_retries: added 3 (faster orphan pool release)
 # Compose environment patch (default profile, no RW_OPT_GC_PROFILE):
-#   - GOGC=150 + GODEBUG=madvdontneed=1 injected
-#   - GOMEMLIMIT removed (Docker mem_limit is the hard cgroup ceiling)
-# RW_OPT_GC_PROFILE=conservative:
-#   - GOMEMLIMIT = (CONTAINER_MEM_MB - 1500) / 100 * 100 MiB, GOGC=100
+#   - default resolves to conservative: GOGC=100 + GODEBUG=madvdontneed=1
+#   - GOMEMLIMIT = (CONTAINER_MEM_MB - 1500) / 100 * 100 MiB (if guard passes)
+# RW_OPT_GC_PROFILE=conservative (and alias default):
+#   - same as default conservative profile
+# RW_OPT_GC_PROFILE=fallback:
+#   - legacy mode: GOGC=150, GOMEMLIMIT removed
 #   - guard: if CONTAINER_MEM_MB - 1500 < 1024 → skip GOMEMLIMIT (warn + degrade)
 # Explicit contract:
 #   - no implicit mutation
@@ -3724,6 +3726,76 @@ calculate_parameters() {
     if [ "$CONTAINER_MEM_MB" -lt 1024 ]; then
         CONTAINER_MEM_MB=1024
     fi
+    if [ -f "$EXISTING_COMPOSE" ] && command -v python3 >/dev/null 2>&1; then
+        local compose_mem_limit_mb
+        compose_mem_limit_mb="$(python3 - "$EXISTING_COMPOSE" "$COMPOSE_SERVICE_NAME" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+compose_path = Path(sys.argv[1])
+service_name = sys.argv[2]
+
+try:
+    import yaml  # type: ignore
+except Exception:
+    print("")
+    raise SystemExit(0)
+
+try:
+    raw = yaml.safe_load(compose_path.read_text(encoding='utf-8')) or {}
+except Exception:
+    print("")
+    raise SystemExit(0)
+
+services = raw.get('services') or {}
+if not isinstance(services, dict):
+    print("")
+    raise SystemExit(0)
+
+svc = services.get(service_name) or {}
+if not isinstance(svc, dict):
+    print("")
+    raise SystemExit(0)
+
+raw_limit = svc.get('mem_limit')
+if raw_limit is None:
+    deploy = svc.get('deploy') or {}
+    resources = deploy.get('resources') if isinstance(deploy, dict) else None
+    limits = resources.get('limits') if isinstance(resources, dict) else None
+    raw_limit = limits.get('memory') if isinstance(limits, dict) else None
+
+if raw_limit is None:
+    print("")
+    raise SystemExit(0)
+
+value = str(raw_limit).strip().lower()
+match = re.match(r'^([0-9]+(?:\.[0-9]+)?)([kmg]i?b?|b)?$', value)
+if not match:
+    print("")
+    raise SystemExit(0)
+
+num = float(match.group(1))
+unit = (match.group(2) or 'b')
+
+if unit in ('g', 'gb', 'gib'):
+    mb = int(num * 1024)
+elif unit in ('m', 'mb', 'mib'):
+    mb = int(num)
+elif unit in ('k', 'kb', 'kib'):
+    mb = int(num / 1024)
+else:
+    mb = int(num / (1024 * 1024))
+
+print(str(mb if mb > 0 else ""))
+PY
+)"
+        if [ -n "$compose_mem_limit_mb" ] && [ "$compose_mem_limit_mb" -gt 0 ] && [ "$compose_mem_limit_mb" -lt "$CONTAINER_MEM_MB" ]; then
+            log_info "Using existing compose mem_limit=${compose_mem_limit_mb}MB as effective GC ceiling (host-derived=${CONTAINER_MEM_MB}MB)"
+            CONTAINER_MEM_MB="$compose_mem_limit_mb"
+        fi
+    fi
+
     CONTAINER_MEM_RESERVE=$((CONTAINER_MEM_MB / 4))
 
     # Reserve 0.5 CPU for host OS, give the rest to the container
@@ -3784,14 +3856,12 @@ calculate_parameters() {
     SWAPPINESS=1
 
     # GC profile: controls Go runtime env vars (GOMEMLIMIT, GOGC) in apply_compose()
-    GC_PROFILE="${RW_OPT_GC_PROFILE:-}"
+    GC_PROFILE_RAW="${RW_OPT_GC_PROFILE:-}"
+    GC_PROFILE="${GC_PROFILE_RAW}"
     case "$GC_PROFILE" in
-        ""|default)
-            GC_PROFILE="default"
-            GOGC_VALUE="150"
-            GOMEMLIMIT_MIB=""
-            ;;
-        conservative)
+        "")
+            GC_PROFILE="conservative"
+            GC_PROFILE_REASON="default(unset)"
             GOGC_VALUE="100"
             GOMEMLIMIT_HEADROOM=$((CONTAINER_MEM_MB - 1500))
             if [ "$GOMEMLIMIT_HEADROOM" -lt 1024 ]; then
@@ -3801,11 +3871,46 @@ calculate_parameters() {
                 GOMEMLIMIT_MIB=$((GOMEMLIMIT_HEADROOM / 100 * 100))
             fi
             ;;
-        *)
-            log_warn "Unknown RW_OPT_GC_PROFILE='${GC_PROFILE}'; falling back to default profile"
-            GC_PROFILE="default"
+        conservative)
+            GC_PROFILE_REASON="explicit(conservative)"
+            GOGC_VALUE="100"
+            GOMEMLIMIT_HEADROOM=$((CONTAINER_MEM_MB - 1500))
+            if [ "$GOMEMLIMIT_HEADROOM" -lt 1024 ]; then
+                log_warn "Container memory ${CONTAINER_MEM_MB}MB too small for conservative GC profile (headroom=${GOMEMLIMIT_HEADROOM}MB < 1024MB); GOMEMLIMIT will NOT be set, GOGC=100 still applies"
+                GOMEMLIMIT_MIB=""
+            else
+                GOMEMLIMIT_MIB=$((GOMEMLIMIT_HEADROOM / 100 * 100))
+            fi
+            ;;
+        default)
+            GC_PROFILE="conservative"
+            GC_PROFILE_REASON="explicit(default-alias)"
+            GOGC_VALUE="100"
+            GOMEMLIMIT_HEADROOM=$((CONTAINER_MEM_MB - 1500))
+            if [ "$GOMEMLIMIT_HEADROOM" -lt 1024 ]; then
+                log_warn "Container memory ${CONTAINER_MEM_MB}MB too small for conservative GC profile (headroom=${GOMEMLIMIT_HEADROOM}MB < 1024MB); GOMEMLIMIT will NOT be set, GOGC=100 still applies"
+                GOMEMLIMIT_MIB=""
+            else
+                GOMEMLIMIT_MIB=$((GOMEMLIMIT_HEADROOM / 100 * 100))
+            fi
+            ;;
+        fallback)
+            GC_PROFILE_REASON="explicit(fallback)"
             GOGC_VALUE="150"
             GOMEMLIMIT_MIB=""
+            ;;
+        *)
+            log_warn "Unknown RW_OPT_GC_PROFILE='${GC_PROFILE}'; falling back to conservative profile"
+            GC_PROFILE="conservative"
+            GC_PROFILE_REASON="default(unknown)"
+            GOGC_VALUE="100"
+            GOMEMLIMIT_HEADROOM=$((CONTAINER_MEM_MB - 1500))
+            if [ "$GOMEMLIMIT_HEADROOM" -lt 1024 ]; then
+                log_warn "Container memory ${CONTAINER_MEM_MB}MB too small for conservative GC profile (headroom=${GOMEMLIMIT_HEADROOM}MB < 1024MB); GOMEMLIMIT will NOT be set, GOGC=100 still applies"
+                GOMEMLIMIT_MIB=""
+            else
+                GOMEMLIMIT_MIB=$((GOMEMLIMIT_HEADROOM / 100 * 100))
+            fi
             ;;
     esac
 
@@ -3852,7 +3957,7 @@ preview_plan() {
     echo "  tcp_max_orphans:       ${TCP_MAX_ORPHANS} (adaptive: MEM_TOTAL_MB*64, clamp [65536, 1048576])"
     echo "  tcp_orphan_retries:    ${TCP_ORPHAN_RETRIES}"
     echo "  swappiness:            ${SWAPPINESS}"
-    echo "  gc_profile:            ${GC_PROFILE} (GOGC=${GOGC_VALUE})"
+    echo "  gc_profile:            ${GC_PROFILE} (${GC_PROFILE_REASON}, GOGC=${GOGC_VALUE})"
     if [ -n "$GOMEMLIMIT_MIB" ]; then
         echo "  gomemlimit:            ${GOMEMLIMIT_MIB} MiB (headroom=container_mem - 1500MB)"
     else
